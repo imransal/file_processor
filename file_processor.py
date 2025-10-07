@@ -4,13 +4,14 @@ File Processing Script for As-Built Extraction
 
 This script processes accommodation schedule and architect spreadsheets to:
 1. Read flat/house references from accommodation_schedule.xlsx (Column D)
-2. Match them with titles in architect_spreadsheet.xlsx (Column B) that start with "Sections"
+2. Match them with titles in architect_spreadsheet.xlsx (Column B) that start with "Sections" or "Floor Plans"
 3. Find corresponding filenames in architect_spreadsheet.xlsx (Column A)
 4. Copy matching files from the architect directory to organized folder structure in processed directory
 5. Files are organized by House Type and renamed with format: drawingtype_housetype.pdf
 
 Example output structure:
 - processed/HT A 3B4P/sections_HTA3B4P.pdf
+- processed/HT A 3B4P/floorplans_HTA3B4P.pdf
 
 Author: GitHub Copilot
 Date: October 2025
@@ -108,8 +109,8 @@ class FileProcessor:
             logging.error(f"Error extracting flat references: {str(e)}")
             return []
     
-    def find_matching_sections(self, flat_refs):
-        """Find matching sections in architect spreadsheet for given flat references"""
+    def find_matching_drawings(self, flat_refs):
+        """Find matching drawings (sections and floor plans) in architect spreadsheet for given flat references"""
         matches = []
         
         try:
@@ -120,9 +121,9 @@ class FileProcessor:
             # Store all flat refs for reporting
             self.detailed_results['all_flat_refs'] = list(flat_refs)
             
-            # Find all section files for reporting
-            section_mask = titles.str.contains("Sections", case=False, na=False)
-            for idx in section_mask[section_mask].index:
+            # Find all drawing files for reporting (both Sections and Floor Plans)
+            drawing_mask = titles.str.contains("Sections|Floor Plans", case=False, na=False, regex=True)
+            for idx in drawing_mask[drawing_mask].index:
                 self.detailed_results['all_section_files'].append({
                     'filename': filenames.iloc[idx],
                     'title': titles.iloc[idx],
@@ -132,11 +133,14 @@ class FileProcessor:
             for flat_ref in flat_refs:
                 self.stats['processed'] += 1
                 
-                # Look for titles that start with "Sections" and contain the flat reference
-                target_pattern = f"Sections - {flat_ref}"
+                # Look for titles that start with "Sections" or "Floor Plans" and contain the flat reference
+                section_pattern = f"Sections - {flat_ref}"
+                floorplan_pattern = f"Floor Plans - {flat_ref}"
                 
-                # Find matching rows
-                matching_rows = titles.str.contains(target_pattern, case=False, na=False)
+                # Find matching rows for both patterns
+                section_matches = titles.str.contains(section_pattern, case=False, na=False)
+                floorplan_matches = titles.str.contains(floorplan_pattern, case=False, na=False)
+                matching_rows = section_matches | floorplan_matches
                 
                 if matching_rows.any():
                     # Get all matches (there might be multiple)
@@ -144,10 +148,19 @@ class FileProcessor:
                         filename = filenames.iloc[idx]
                         title = titles.iloc[idx]
                         
+                        # Determine drawing type from title
+                        if "Sections" in title:
+                            drawing_type = "sections"
+                        elif "Floor Plans" in title:
+                            drawing_type = "floorplans"
+                        else:
+                            drawing_type = "unknown"
+                        
                         match_info = {
                             'flat_ref': flat_ref,
                             'title': title,
                             'filename': filename,
+                            'drawing_type': drawing_type,
                             'row_index': idx
                         }
                         
@@ -166,13 +179,13 @@ class FileProcessor:
                     self.stats['not_found'] += 1
                     self.detailed_results['no_matches_found'].append({
                         'flat_ref': flat_ref,
-                        'reason': 'No matching section found in architect spreadsheet'
+                        'reason': 'No matching drawings (sections or floor plans) found in architect spreadsheet'
                     })
             
-            # Find unused section files
-            for section_file in self.detailed_results['all_section_files']:
-                if not section_file['matched']:
-                    self.detailed_results['unused_section_files'].append(section_file)
+            # Find unused drawing files
+            for drawing_file in self.detailed_results['all_section_files']:
+                if not drawing_file['matched']:
+                    self.detailed_results['unused_section_files'].append(drawing_file)
             
             logging.info(f"Total matches found: {len(matches)}")
             return matches
@@ -244,8 +257,9 @@ class FileProcessor:
                 })
                 return False
             
-            # Generate new filename
-            new_filename = self.generate_new_filename(source_filename_with_ext, match_info['flat_ref'])
+            # Generate new filename with drawing type
+            drawing_type = match_info.get('drawing_type', 'sections')
+            new_filename = self.generate_new_filename(source_filename_with_ext, match_info['flat_ref'], drawing_type)
             
             # Create destination file path with new filename
             dest_file = destination_path / new_filename
@@ -296,10 +310,10 @@ class FileProcessor:
             logging.error("No flat references found. Exiting.")
             return False
         
-        # Find matching sections
-        matches = self.find_matching_sections(flat_refs)
+        # Find matching drawings (sections and floor plans)
+        matches = self.find_matching_drawings(flat_refs)
         if not matches:
-            logging.warning("No matches found.")
+            logging.warning("No drawing matches found.")
             return True
         
         # Process each match
@@ -513,8 +527,8 @@ class FileProcessor:
                     ],
                     'Value': [
                         datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'File Processor v2.0',
-                        'Sections',
+                        'File Processor v2.1',
+                        'Sections and Floor Plans',
                         'accomodation_schedule.xlsx, architect_spreadsheet.xlsx'
                     ]
                 }
