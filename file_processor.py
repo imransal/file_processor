@@ -19,6 +19,7 @@ Date: October 2025
 
 import pandas as pd
 import os
+import re
 import shutil
 from pathlib import Path
 import logging
@@ -133,14 +134,58 @@ class FileProcessor:
             for flat_ref in flat_refs:
                 self.stats['processed'] += 1
                 
-                # Look for titles that start with "Sections" or "Floor Plans" and contain the flat reference
+                # Extract the flat type prefix (e.g., "FT A" from "FT A 1B2P")
+                # This handles cases where architect spreadsheet uses abbreviated forms like "Flat Types A & B"
+                flat_type_prefix = None
+                house_type_base = None
+                
+                if flat_ref.startswith('FT '):
+                    # For flat types, extract just "FT X" part (e.g., "FT A" from "FT A 1B2P")
+                    parts = flat_ref.split()
+                    if len(parts) >= 2:
+                        flat_type_prefix = parts[1]  # Get the letter (A, B, C, etc.)
+                elif flat_ref.startswith('HT '):
+                    # For house types, extract base without bed/person count
+                    # e.g., "HT C3H5 3B5P" -> "HT C3H5"
+                    match = re.match(r'(HT\s+[A-Z0-9H]+)', flat_ref)
+                    if match:
+                        house_type_base = match.group(1)
+                
+                # Build search patterns
                 section_pattern = f"Sections - {flat_ref}"
                 floorplan_pattern = f"Floor Plans - {flat_ref}"
                 
-                # Find matching rows for both patterns
+                # For flat types, also search for abbreviated forms
                 section_matches = titles.str.contains(section_pattern, case=False, na=False)
                 floorplan_matches = titles.str.contains(floorplan_pattern, case=False, na=False)
-                matching_rows = section_matches | floorplan_matches
+                
+                # Additional patterns for flat types using abbreviated notation
+                if flat_type_prefix:
+                    # Match patterns like "Flat Type E", "Flat Types A & B", "FT A 1B2P & FT B 1B2P"
+                    # Use word boundary to match the letter anywhere in the flat type designation
+                    flat_type_pattern = rf'\bFlat Type[s]?\s+[A-Z\s&]*\b{flat_type_prefix}\b'
+                    ft_abbrev_pattern = rf'\bFT\s+[A-Z0-9\s&]*\b{flat_type_prefix}\b'
+                    
+                    flat_type_matches = titles.str.contains(flat_type_pattern, case=False, na=False, regex=True)
+                    ft_abbrev_matches = titles.str.contains(ft_abbrev_pattern, case=False, na=False, regex=True)
+                    
+                    matching_rows = section_matches | floorplan_matches | flat_type_matches | ft_abbrev_matches
+                elif house_type_base:
+                    # For house types, also match the base pattern without bed/person count
+                    # e.g., "HT C3H5 3B5P" should also match "Floor Plans - HT C3H5"
+                    section_base_pattern = f"Sections - {house_type_base}"
+                    floorplan_base_pattern = f"Floor Plans - {house_type_base}"
+                    section_base_singular = f"Section - {house_type_base}"  # Some use singular "Section"
+                    floorplan_base_singular = f"Floor Plan - {house_type_base}"
+                    
+                    section_base_matches = titles.str.contains(section_base_pattern, case=False, na=False)
+                    floorplan_base_matches = titles.str.contains(floorplan_base_pattern, case=False, na=False)
+                    section_singular_matches = titles.str.contains(section_base_singular, case=False, na=False)
+                    floorplan_singular_matches = titles.str.contains(floorplan_base_singular, case=False, na=False)
+                    
+                    matching_rows = section_matches | floorplan_matches | section_base_matches | floorplan_base_matches | section_singular_matches | floorplan_singular_matches
+                else:
+                    matching_rows = section_matches | floorplan_matches
                 
                 if matching_rows.any():
                     # Get all matches (there might be multiple)
@@ -148,16 +193,28 @@ class FileProcessor:
                         filename = filenames.iloc[idx]
                         title = titles.iloc[idx]
                         
+                        # Only process Sections and Floor Plans - skip other drawing types
+                        if not (re.search(r'\bSections\b', title, re.IGNORECASE) or 
+                                re.search(r'\bFloor Plans?\b', title, re.IGNORECASE)):
+                            continue
+                        
                         # Determine drawing type from title
                         if "Sections" in title:
                             drawing_type = "sections"
-                        elif "Floor Plans" in title:
+                        elif "Floor Plan" in title:  # Matches both "Floor Plans" and "Floor Plan"
                             drawing_type = "floorplans"
                         else:
                             drawing_type = "unknown"
                         
+                        # Extract folder name from architect spreadsheet title
+                        folder_name = self.extract_folder_name_from_title(title)
+                        if not folder_name:
+                            logging.warning(f"Could not extract folder name from title: {title}")
+                            continue
+                        
                         match_info = {
                             'flat_ref': flat_ref,
+                            'folder_name': folder_name,
                             'title': title,
                             'filename': filename,
                             'drawing_type': drawing_type,
@@ -194,10 +251,69 @@ class FileProcessor:
             logging.error(f"Error finding matches: {str(e)}")
             return []
     
-    def create_output_structure(self, flat_ref):
-        """Create the output folder structure: HT A 3B4P > files"""
+    def extract_folder_name_from_title(self, title):
+        """Extract the folder name from architect spreadsheet title
+        Flat Types (FT): Compact format without spaces around &
+        House Types (HT): Keep spaces as in architect spreadsheet
+        
+        Examples:
+        'Floor Plans - Flat Types A & B' -> 'FT A&B'
+        'Sections - FT A 1B2P & FT B 1B2P' -> 'FT A&B'
+        'Sections - Flat Type E' -> 'FT E'
+        'Sections - HT A 3B4P' -> 'HT A 3B4P'
+        'Floor Plans - HT B 2B3P & HT D 3B4P' -> 'HT B 2B3P & HT D 3B4P'
+        """
         try:
-            output_path = self.processed_path / flat_ref
+            # Split by ' - ' to get the part after the drawing type
+            if ' - ' not in title:
+                return None
+            
+            # Get the part after the first ' - '
+            parts = title.split(' - ', 1)
+            group_name = parts[1].strip()
+            
+            # Check if this is a Flat Type reference
+            is_flat_type = bool(re.search(r'\bFlat Type[s]?\b|\bFT\b', group_name, re.IGNORECASE))
+            
+            if is_flat_type:
+                # Normalize "Flat Types A & B" or "Flat Type E" -> "FT ..."
+                group_name = re.sub(r'Flat Types?\s+', 'FT ', group_name, flags=re.IGNORECASE)
+                
+                # For patterns like "FT A 1B2P & FT B 1B2P" -> "FT A&B"
+                # Extract just the letters from multiple FT references
+                ft_pattern = r'FT\s+([A-Z])\s+\d+B\d+P(?:\s*&\s*FT\s+([A-Z])\s+\d+B\d+P)*'
+                ft_match = re.match(ft_pattern, group_name, re.IGNORECASE)
+                if ft_match:
+                    # Extract all letters
+                    letters = re.findall(r'FT\s+([A-Z])', group_name, re.IGNORECASE)
+                    if letters:
+                        return 'FT ' + '&'.join(letters)  # No spaces around &
+                
+                # For already normalized patterns like "FT A & B" -> "FT A&B"
+                # Match "FT X & Y" or "FT X & Y & Z" patterns
+                ft_simple_pattern = r'FT\s+([A-Z])(?:\s*&\s*([A-Z]))+(?:\s*&\s*([A-Z]))*'
+                ft_simple_match = re.match(ft_simple_pattern, group_name, re.IGNORECASE)
+                if ft_simple_match:
+                    # Extract all single letters after FT
+                    letters = re.findall(r'(?:^FT\s+|&\s*)([A-Z])', group_name, re.IGNORECASE)
+                    if letters:
+                        return 'FT ' + '&'.join(letters)  # No spaces around &
+                
+                # For single flat type like "FT E"
+                if re.match(r'FT\s+[A-Z]$', group_name, re.IGNORECASE):
+                    return group_name
+            
+            # For house types (HT), keep the original format from architect spreadsheet
+            return group_name
+            
+        except Exception as e:
+            logging.error(f"Error extracting folder name from title '{title}': {str(e)}")
+            return None
+    
+    def create_output_structure(self, folder_name):
+        """Create the output folder structure based on architect spreadsheet grouping"""
+        try:
+            output_path = self.processed_path / folder_name
             output_path.mkdir(parents=True, exist_ok=True)
             
             logging.info(f"Created directory structure: {output_path}")
@@ -207,11 +323,12 @@ class FileProcessor:
             logging.error(f"Error creating directory structure: {str(e)}")
             return None
     
-    def generate_new_filename(self, original_filename, flat_ref, drawing_type="sections"):
-        """Generate new filename in format drawingtype_housetype_originalname.pdf"""
+    def generate_new_filename(self, original_filename, folder_name, drawing_type="sections"):
+        """Generate new filename in format drawingtype_foldername_originalname.pdf"""
         try:
-            # Remove spaces from flat_ref and convert to format like HTA3B4P
-            house_type = flat_ref.replace(" ", "")
+            # Remove spaces and special chars from folder_name for filename
+            # "FT A & B" -> "FTA&B", "HT B 2B3P & HT D 3B4P" -> "HTB2B3P&HTD3B4P"
+            clean_folder = folder_name.replace(" ", "")
             
             # Get the original filename without extension for uniqueness
             orig_name = original_filename
@@ -221,8 +338,8 @@ class FileProcessor:
             else:
                 file_ext = ".pdf"  # Default to PDF
             
-            # Create new filename: drawingtype_housetype_originalname.ext
-            new_filename = f"{drawing_type}_{house_type}_{orig_name}{file_ext}"
+            # Create new filename: drawingtype_foldername_originalname.ext
+            new_filename = f"{drawing_type}_{clean_folder}_{orig_name}{file_ext}"
             
             logging.info(f"Generated new filename: {original_filename} -> {new_filename}")
             return new_filename
@@ -259,7 +376,7 @@ class FileProcessor:
             
             # Generate new filename with drawing type
             drawing_type = match_info.get('drawing_type', 'sections')
-            new_filename = self.generate_new_filename(source_filename_with_ext, match_info['flat_ref'], drawing_type)
+            new_filename = self.generate_new_filename(source_filename_with_ext, match_info['folder_name'], drawing_type)
             
             # Create destination file path with new filename
             dest_file = destination_path / new_filename
@@ -318,11 +435,11 @@ class FileProcessor:
         
         # Process each match
         for match in matches:
-            flat_ref = match['flat_ref']
+            folder_name = match['folder_name']
             filename = match['filename']
             
             # Create output directory structure
-            output_dir = self.create_output_structure(flat_ref)
+            output_dir = self.create_output_structure(folder_name)
             if output_dir is None:
                 continue
             
